@@ -22,20 +22,44 @@ def encode_base64_payload(data: bytes) -> str:
             return payload
         suffix += 1
 
+def encode_malformed_payload(event_id: int, label: str, data: bytes) -> str:
+    return f"{data.hex()[:10]}!{label}~{event_id}"
+
+
 records = []
 for event_id in range(1, 50_001):
     span = 6 + (event_id % 23)
-    digest = hashlib.sha256(f"event:{event_id}:telemetry".encode("ascii")).digest()[:span]
-    if event_id % 53 == 0:
-        payload = ""
-    elif event_id % 37 == 0:
-        payload = digest.hex().upper()
+    digest_a = hashlib.sha256(f"event:{event_id}:server-a".encode("ascii")).digest()[:span]
+    digest_b = hashlib.sha256(f"event:{event_id}:server-b".encode("ascii")).digest()[: span + 1]
+    if event_id % 61 == 0:
+        payload_a = encode_base64_payload(digest_a)
+        payload_b = digest_b.hex().upper()
+    elif event_id % 47 == 0:
+        payload_a = digest_a.hex().upper()
+        payload_b = encode_base64_payload(digest_b)
+    elif event_id % 41 == 0:
+        payload_a = encode_malformed_payload(event_id, "a", digest_a)
+        payload_b = encode_base64_payload(digest_b)
+    elif event_id % 31 == 0:
+        payload_a = ""
+        payload_b = digest_b.hex().upper()
+    elif event_id % 29 == 0:
+        payload_a = encode_base64_payload(digest_a)
+        payload_b = encode_malformed_payload(event_id, "b", digest_b)
+    elif event_id % 23 == 0:
+        payload_a = digest_a.hex().upper()
+        payload_b = ""
+    elif event_id % 7 == 0:
+        payload_a = digest_a.hex().upper()
+        payload_b = ""
     else:
-        payload = encode_base64_payload(digest)
+        payload_a = encode_base64_payload(digest_a)
+        payload_b = encode_malformed_payload(event_id, "b", digest_b) if event_id % 5 == 0 else ""
     records.append(
         {
             "event_id": event_id,
-            "payload": payload,
+            "payload_a": payload_a,
+            "payload_b": payload_b,
             "source": random.choice(sources),
             "event_type": random.choice(event_types),
             "attempt": 1 + (event_id % 4),
@@ -43,11 +67,51 @@ for event_id in range(1, 50_001):
         }
     )
 
-with output_path.open("w", encoding="utf-8") as handle:
-    index = 0
-    while index < len(records):
-        group_size = random.randint(1, 6)
-        chunk = records[index : index + group_size]
-        handle.write("".join(json.dumps(record, separators=(",", ":")) for record in chunk))
-        handle.write("\n")
-        index += group_size
+record_blobs = [json.dumps(record, separators=(",", ":")).encode("utf-8") for record in records]
+noise_chunks = [
+    b"\x00\xff\x1e",
+    b"\x81\xfe\x80",
+    b"\x00BROKEN\xff",
+    b"\x7f\x00\xffTRACE",
+]
+
+
+def truncated_fragment(blob: bytes) -> bytes:
+    if len(blob) < 18:
+        return blob[: max(1, len(blob) - 1)]
+    cut = random.randint(12, len(blob) - 2)
+    return blob[:cut]
+
+
+inserted_noise = 0
+inserted_fragments = 0
+buffer = bytearray()
+index = 0
+while index < len(record_blobs):
+    group_size = random.randint(1, 6)
+    chunk = record_blobs[index : index + group_size]
+    for offset, blob in enumerate(chunk, start=index):
+        event_id = offset + 1
+        if event_id % 11 == 0:
+            buffer.extend(random.choice(noise_chunks))
+            inserted_noise += 1
+        if event_id % 17 == 0:
+            fragment_source = record_blobs[(offset + 137) % len(record_blobs)]
+            buffer.extend(truncated_fragment(fragment_source))
+            inserted_fragments += 1
+        buffer.extend(blob)
+        if event_id % 19 == 0:
+            buffer.extend(b"}")
+            inserted_fragments += 1
+        if event_id % 23 == 0:
+            buffer.extend(random.choice(noise_chunks))
+            inserted_noise += 1
+    if index % 9 == 0:
+        buffer.extend(random.choice(noise_chunks))
+        inserted_noise += 1
+    buffer.extend(b"\n")
+    index += group_size
+
+assert inserted_noise > 0
+assert inserted_fragments > 0
+output_path.write_bytes(bytes(buffer))
